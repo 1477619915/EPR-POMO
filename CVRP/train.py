@@ -122,19 +122,13 @@ def train(model, training, T, start_steps, train_steps, mixed, train_batch_size,
         advantage = rewards - bl_val           # [train_batch, mul]
 
         # HGS优化损失函数
-                if i > 0 and (i == 1 or i % 1000 == 0):
-            # 构造 HGS 需要的 Tensor 字典
-            # 注意：generate_vrp_data 生成的 numpy 数组可能没有维度问题，
-            # 但转 Tensor 时需注意 device 和类型
+        if i > 0 and (i == 1 or i % 1000 == 0):
+
             hgs_batch = {
                 'depot': torch.as_tensor(batch['depot'], device=device, dtype=torch.float32),
                 'loc': torch.as_tensor(batch['loc'], device=device, dtype=torch.float32),
                 'demand': torch.as_tensor(batch['demand'], device=device, dtype=torch.float32)
             }
-
-            # 这里的 hgs_batch['depot'] 应该是 [Batch, 2]
-            # 这里的 hgs_batch['loc'] 应该是 [Batch, N, 2]
-            # utils.py 中的 hgs_solution 现在能处理这些维度
 
             with torch.no_grad():
                 elite_costs, elite_seqs = hgs_solution(
@@ -143,8 +137,6 @@ def train(model, training, T, start_steps, train_steps, mixed, train_batch_size,
                     num_vehicles=problem_size,
                     time_limit=epr_params['time_limit']
                 )
-
-            # rewards 是负的距离，EPR 需要正的距离
             model_costs = -rewards
 
             modulation, gap_weights = calculate_epr_modulation(
@@ -174,11 +166,7 @@ def train(model, training, T, start_steps, train_steps, mixed, train_batch_size,
             J = - advantage * log_prob
 
         if scale_norm:
-            # 你的原始代码: J = J / advantage.max(dim=1)[0][:, None]
-            # 这通常是为了稳定梯度。注意这会改变 Loss 的量级。
-            # 这里 max_val 需要防止为0
             max_adv = advantage.max(dim=1)[0][:, None]
-            # 避免除零错误
             max_adv[max_adv == 0] = 1.0
             J = J / max_adv
         J = J.mean()
