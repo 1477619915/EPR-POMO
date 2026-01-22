@@ -156,67 +156,71 @@ class Logger(object):
     with open(self.filename, 'w') as f:
         json.dump(self.logger, f)
 
-# 分类高质量和低质量解
-def split_solutions_by_rewards(rewards, solutions, bl_val):
-    higher = []
-    lower = []
+# # 保存hgs_costs数据
+# def save_hgs_costs(file_path, i, hgs_costs):
+#     """
+#     保存 i 和 hgs_costs 到文件中，数据以 Tensor 格式保存。
+#     """
+#     try:
+#         # 如果文件已存在，先读取已有数据
+#         existing_data = torch.load(file_path)
+#     except FileNotFoundError:
+#         existing_data = {}  # 文件不存在时，初始化为空字典
 
-    for i in range(rewards.shape[0]):
-        for j in range(rewards.shape[1]):
-            if rewards[i, j] > bl_val[i, 0]:
-                higher.append(solutions[i, j])
-            elif rewards[i, j] < bl_val[i, 0]:
-                lower.append(solutions[i, j])
+#     # 更新字典，将当前 i 对应的 hgs_costs 添加进去
+#     existing_data[i] = hgs_costs
 
-    return higher, lower
+#     # 保存更新后的数据
+#     torch.save(existing_data, file_path)
 
-# 截取子串及翻转
-def generate_substrings_with_reverse(solution, K):
-    substrings = []
-    start = 0
+# # 加载hgs_costs数据
+# def load_hgs_costs(file_path, i):
+#     """
+#     根据 i 从文件中加载对应的 hgs_costs，数据为 Tensor 格式。
+#     """
+#     data = torch.load(file_path)  # 加载整个文件内容
+#     if i in data:
+#         return data[i]  # 返回对应 i 的 hgs_costs
+#     else:
+#         raise KeyError(f"Key {i} not found in the saved data.")
 
-    for i in range(len(solution)):
-        if solution[i] == 0:
-            if start < i:
-                segment = solution[start:i]
-                for j in range(len(segment) - K + 1):
-                    subseq = segment[j:j+K]
-                    substrings.append(subseq)
-                    substrings.append(subseq[::-1])
-            start = i + 1
-
-    # 处理末尾不是 0 的情况
-    if start < len(solution):
-        segment = solution[start:]
-        for j in range(len(segment) - K + 1):
-            subseq = segment[j:j+K]
-            substrings.append(subseq)
-            substrings.append(subseq[::-1])
-
-    return substrings
-
-# 计算HGS指导幅度
-def compute_cost_difference(hgs_costs, rewards, advantage, weight=1.0):
-    cost_difference = hgs_costs - rewards
-    cost_difference = weight / (cost_difference + 1e-6)
-    mask1 = (advantage > 0) & (cost_difference > 0)
-    return cost_difference, mask1
-
-# 读取 batch 并转换为求解格式
 def prepare_vrp_data(depot, node_coords, node_demand, num_vehicles=100, vehicle_capacity=1.0):
     data = dict()
-    coordinates = torch.cat((depot, node_coords), dim=0)
+    # 确保输入在CPU上
+    if isinstance(depot, torch.Tensor): depot = depot.cpu()
+    if isinstance(node_coords, torch.Tensor): node_coords = node_coords.cpu()
+    if isinstance(node_demand, torch.Tensor): node_demand = node_demand.cpu()
+
+    # 维度安全检查：确保 depot 是 [1, 2]，node_coords 是 [N, 2]
+    if depot.dim() == 1:
+        depot = depot.unsqueeze(0)
+    if depot.dim() > 2:
+        depot = depot.reshape(1, 2)
+
+    if node_coords.dim() > 2:
+        node_coords = node_coords.reshape(-1, 2)
+
+    # 拼接坐标
+    try:
+        coordinates = torch.cat((depot, node_coords), dim=0)
+    except RuntimeError as e:
+        print(f"Error in cat: depot shape {depot.shape}, node_coords shape {node_coords.shape}")
+        raise e
+
+    # HGS通常需要需求也是列表
     demands = torch.cat((torch.tensor([0.0]), node_demand))
 
     # 计算距离矩阵
+    coords_np = coordinates.numpy()
     num_nodes = len(coordinates)
     distance_matrix = np.zeros((num_nodes, num_nodes))
+
+    # 简单的距离计算
     for i in range(num_nodes):
         for j in range(num_nodes):
-            if i != j:
-                x1, y1 = coordinates[i][0], coordinates[i][1]
-                x2, y2 = coordinates[j][0], coordinates[j][1]
-                distance_matrix[i][j] = math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+            dist = math.sqrt((coords_np[i][0] - coords_np[j][0]) ** 2 +
+                             (coords_np[i][1] - coords_np[j][1]) ** 2)
+            distance_matrix[i][j] = dist
 
     data['coordinates'] = coordinates.tolist()
     data['demands'] = demands.tolist()
@@ -225,61 +229,129 @@ def prepare_vrp_data(depot, node_coords, node_demand, num_vehicles=100, vehicle_
     data['service_times'] = np.zeros(len(data['demands'])).tolist()
     data['num_vehicles'] = num_vehicles
     data['vehicle_capacity'] = vehicle_capacity
-
     return data
 
-# HGS求解近似最优解
-def hgs_solution(batch, device, num_vehicles=100, vehicle_capacity=1.0, time_limit=10):
+
+def hgs_solution(batch, device, num_vehicles=100, vehicle_capacity=1.0, time_limit=1.0):
     # 配置 HGS Solver
-    ap = hgs.AlgorithmParameters(timeLimit=10, targetFeasible=0.01, nbElite=75, lambda_=1)
+    ap = hgs.AlgorithmParameters(timeLimit=time_limit, targetFeasible=0.01)
     hgs_solver = hgs.Solver(parameters=ap, verbose=False)
 
-    results = []
     costs = []
-    for i in range(len(batch["depot"])):
-        depot = batch["depot"][i]
-        node_coords = batch["loc"][i]
+    temp_seqs = []
+    max_seq_len = 0
+
+    batch_size = batch['depot'].size(0)
+
+    for i in range(batch_size):
+        # --- 维度修正核心部分 ---
+        # 1. 提取当前实例的数据 (去掉 Batch 维度)
+        depot = batch["depot"][i]  # 通常变为 [2] 或 [1, 2]
+        node_coords = batch["loc"][i]  # 通常变为 [N, 2]
         node_demand = batch["demand"][i]
+
+        # 2. 强制形状对齐
+        # 确保 depot 是 [1, 2]
+        if depot.dim() == 1:
+            depot = depot.unsqueeze(0)  # [2] -> [1, 2]
+        elif depot.dim() == 3:
+            depot = depot.squeeze(0)  # [1, 1, 2] -> [1, 2]
+
+        # 确保 node_coords 是 [N, 2]
+        if node_coords.dim() == 3:
+            node_coords = node_coords.squeeze(0)
 
         # 准备 VRP 数据
         vrp_data = prepare_vrp_data(depot, node_coords, node_demand, num_vehicles, vehicle_capacity)
 
-        # 求解 VRP
+        # 求解
         result = hgs_solver.solve_cvrp(vrp_data)
-        results.append({
-            "cost": -result.cost,
-            "routes": result.routes
-        })
-        costs.append(-result.cost)
-    costs = torch.tensor(costs, dtype=torch.float32).view(-1, 1).to(device)  # 转为 [batch, 1]
-    return costs
 
-# 保存hgs_costs数据
-def save_hgs_costs(file_path, i, hgs_costs):
-    """
-    保存 i 和 hgs_costs 到文件中，数据以 Tensor 格式保存。
-    """
-    try:
-        # 如果文件已存在，先读取已有数据
-        existing_data = torch.load(file_path)
-    except FileNotFoundError:
-        existing_data = {}  # 文件不存在时，初始化为空字典
+        # 记录 Cost
+        costs.append(result.cost)
 
-    # 更新字典，将当前 i 对应的 hgs_costs 添加进去
-    existing_data[i] = hgs_costs
+        # 线性化 Route
+        flat_seq = [0]
+        for route in result.routes:
+            flat_seq.extend(route)
+            flat_seq.append(0)
 
-    # 保存更新后的数据
-    torch.save(existing_data, file_path)
+        temp_seqs.append(flat_seq)
+        max_seq_len = max(max_seq_len, len(flat_seq))
 
-# 加载hgs_costs数据
-def load_hgs_costs(file_path, i):
-    """
-    根据 i 从文件中加载对应的 hgs_costs，数据为 Tensor 格式。
-    """
-    data = torch.load(file_path)  # 加载整个文件内容
-    if i in data:
-        return data[i]  # 返回对应 i 的 hgs_costs
-    else:
-        raise KeyError(f"Key {i} not found in the saved data.")
+    # Padding
+    padded_seqs = np.zeros((batch_size, max_seq_len), dtype=np.int64)
+    for i, seq in enumerate(temp_seqs):
+        padded_seqs[i, :len(seq)] = seq
+
+    # 转为 Tensor
+    costs_tensor = torch.tensor(costs, dtype=torch.float32).view(-1, 1).to(device)
+    seqs_tensor = torch.tensor(padded_seqs, dtype=torch.long).to(device)
+
+    return costs_tensor, seqs_tensor
+
+
+def extract_path_patterns(seq, k):
+    patterns = set()
+    if isinstance(seq, torch.Tensor):
+        seq = seq.tolist()
+    elif isinstance(seq, np.ndarray):
+        seq = seq.tolist()
+
+    seq_len = len(seq)
+    for i in range(seq_len - k + 1):
+        pattern = tuple(seq[i: i + k])
+        patterns.add(pattern)
+    return patterns
+
+
+def calculate_epr_modulation(model_seqs, model_costs, elite_seqs, elite_costs, k=3, eta=0.05):
+    batch_size, pomo_size, model_len = model_seqs.size()
+    device = model_seqs.device
+
+    modulation_matrix = torch.zeros((batch_size, pomo_size, model_len), device=device)
+    gap_weights = torch.ones((batch_size, pomo_size), device=device)
+    f_avg = model_costs.mean(dim=1, keepdim=True)
+
+    model_seqs_cpu = model_seqs.cpu().numpy()
+    elite_seqs_cpu = elite_seqs.cpu().numpy()
+
+    for b in range(batch_size):
+        e_cost = elite_costs[b].item()
+        e_seq = elite_seqs_cpu[b]
+        elite_patterns = extract_path_patterns(e_seq, k)
+
+        reversed_patterns = set()
+        for p in elite_patterns:
+            reversed_patterns.add(tuple(reversed(p)))
+        elite_patterns.update(reversed_patterns)
+
+        for m in range(pomo_size):
+            m_cost = model_costs[b, m].item()
+            m_seq = model_seqs_cpu[b, m]
+
+            delta_i = m_cost - e_cost
+            if delta_i <= 1e-6: continue
+
+            normalized_delta = delta_i / (e_cost + 1e-5)
+            gap_weights[b, m] = 1.0 + normalized_delta
+            delta_p = eta / (normalized_delta + 1e-2)
+
+            is_superior = m_cost <= f_avg[b].item()
+
+            for t in range(model_len - k + 1):
+                pattern = tuple(m_seq[t: t + k])
+                in_elite = pattern in elite_patterns
+
+                if is_superior and in_elite:
+                    for offset in range(k):
+                        if t + offset < model_len:
+                            modulation_matrix[b, m, t + offset] += delta_p
+                elif (not is_superior) and (not in_elite):
+                    for offset in range(k):
+                        if t + offset < model_len:
+                            modulation_matrix[b, m, t + offset] -= delta_p
+
+    return modulation_matrix, gap_weights
 
 
