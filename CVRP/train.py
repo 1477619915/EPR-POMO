@@ -122,18 +122,65 @@ def train(model, training, T, start_steps, train_steps, mixed, train_batch_size,
         advantage = rewards - bl_val           # [train_batch, mul]
 
         # HGS优化损失函数
-        if i > 0 and (i == 1 or i % 1000 == 0):
-            # if hgs_file_exists:
-            #     hgs_costs = load_hgs_costs(hgs_file_path, i)
-            # else:
-            hgs_costs = hgs_solution(batch, device=device)  # hgs_costs为[train_batch, 100]并且是负数
-            cost_difference, mask1 = compute_cost_difference(hgs_costs, rewards, advantage, weight=1.0)
-            J = - (advantage + cost_difference * 2) * log_prob * mask1 +  (-advantage * log_prob) * ~mask1
+                if i > 0 and (i == 1 or i % 1000 == 0):
+            # 构造 HGS 需要的 Tensor 字典
+            # 注意：generate_vrp_data 生成的 numpy 数组可能没有维度问题，
+            # 但转 Tensor 时需注意 device 和类型
+            hgs_batch = {
+                'depot': torch.as_tensor(batch['depot'], device=device, dtype=torch.float32),
+                'loc': torch.as_tensor(batch['loc'], device=device, dtype=torch.float32),
+                'demand': torch.as_tensor(batch['demand'], device=device, dtype=torch.float32)
+            }
+
+            # 这里的 hgs_batch['depot'] 应该是 [Batch, 2]
+            # 这里的 hgs_batch['loc'] 应该是 [Batch, N, 2]
+            # utils.py 中的 hgs_solution 现在能处理这些维度
+
+            with torch.no_grad():
+                elite_costs, elite_seqs = hgs_solution(
+                    hgs_batch,
+                    device=device,
+                    num_vehicles=problem_size,
+                    time_limit=epr_params['time_limit']
+                )
+
+            # rewards 是负的距离，EPR 需要正的距离
+            model_costs = -rewards
+
+            modulation, gap_weights = calculate_epr_modulation(
+                model_seqs=solutions,
+                model_costs=model_costs,
+                elite_seqs=elite_seqs,
+                elite_costs=elite_costs,
+                k=epr_params['pattern_length'],
+                eta=epr_params['eta']
+            )
+
+            # probs shape: [Batch, Seq_Len, Mul]
+            # modulation shape: [Batch, Mul, Seq_Len] -> Transpose -> [Batch, Seq_Len, Mul]
+            log_prob_seq = probs.log() + modulation.transpose(1, 2)
+            modulated_log_prob = log_prob_seq.sum(dim=1)  # [Batch, Mul]
+
+            # Loss Calculation
+            # Advantage > 0 means Better (since reward is negative distance, bigger is better)
+            # We minimize Loss.
+            # J = - (Gap * Adv * LogProb)
+            weighted_advantage = advantage * gap_weights
+            J = - weighted_advantage * modulated_log_prob
+
         else:
+            # Original Loss
+            log_prob = probs.log().sum(dim=1)
             J = - advantage * log_prob
+
         if scale_norm:
-            # J = J / (advantage ** 2).mean(dim=1)
-            J = J / advantage.max(dim=1)[0][:, None]
+            # 你的原始代码: J = J / advantage.max(dim=1)[0][:, None]
+            # 这通常是为了稳定梯度。注意这会改变 Loss 的量级。
+            # 这里 max_val 需要防止为0
+            max_adv = advantage.max(dim=1)[0][:, None]
+            # 避免除零错误
+            max_adv[max_adv == 0] = 1.0
+            J = J / max_adv
         J = J.mean()
 
         # print("training length: {:.4f}".format(-rewards.max(1)[0].mean()))
